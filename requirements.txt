@@ -1,0 +1,6 @@
+scipy>=1.12.0
+numpy>=1.26.3
+tqdm>=4.66.1
+Pillow>=10.2.0
+easyocr>=1.7.1
+pyass>=0.1.4
