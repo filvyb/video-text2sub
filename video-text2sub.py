@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,7 @@ from PIL import Image
 
 
 class Frame:
-    def __init__(self, image: Image, frame_num: int, ts: pyass.timedelta):
+    def __init__(self, image: Image.Image | str, frame_num: int, ts: pyass.timedelta):
         self.image = image
         self.frame_num = frame_num
         self.ts = ts
@@ -26,7 +27,10 @@ class Frame:
         hash_size = 8
         highfreq_factor = 4
 
-        image = self.image
+        if isinstance(self.image, str):
+            image = Image.open(self.image)
+        else:
+            image = self.image
 
         img_size = hash_size * highfreq_factor
         image = image.convert('L')
@@ -56,8 +60,10 @@ class VideoProcessor:
         self.lang = langs
         self.frames = []
         self.reader = easyocr.Reader(langs, gpu=gpu)
+        self.tempdir = None
+        self.size = None
 
-    def _get_frames(self, videopath: str, rate: int = 1):
+    def _get_frames(self, videopath: str, rate: int = 1, memory: bool = False):
         cmd = f"ffprobe -v error -select_streams v -of default=noprint_wrappers=1:nokey=1 -show_entries stream=r_frame_rate {videopath}"
         cmd = shlex.split(cmd)
         ret = subprocess.run(cmd, capture_output=True, check=True)
@@ -66,22 +72,27 @@ class VideoProcessor:
             raise ValueError("Rate higher than video framerate")
         print(self.framerate)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # ret = os.system(f"ffmpeg -i {videopath} -vf fps={rate}/1 {tmpdir}/%d.jpg")
-            tmp = os.path.join(tmpdir, "%d.jpg")
-            cmd = f"ffmpeg -i {videopath} -vf fps={rate}/1 {tmp}"
-            cmd = shlex.split(cmd)
-            subprocess.run(cmd, check=True)
+        self.tempdir = tempfile.TemporaryDirectory()
+        tmpdir = self.tempdir.name
+        # ret = os.system(f"ffmpeg -i {videopath} -vf fps={rate}/1 {tmpdir}/%d.jpg")
+        tmp = os.path.join(tmpdir, "%d.jpg")
+        cmd = f"ffmpeg -i {videopath} -vf fps={rate}/1 {tmp}"
+        cmd = shlex.split(cmd)
+        subprocess.run(cmd, check=True)
 
-            for i, f in enumerate(os.listdir(tmpdir)):
-                print(f"Processing frame {i}{f} in {tmpdir}")
-                frame_num = int(f.split(".")[0])
-                frame_in_sec = self.framerate / (rate + 1)  # TODO: calc timestamp
-                ts = frame_in_sec + (frame_num - 1) * self.framerate
-                ts = pyass.timedelta(seconds=ts)
+        for i, f in enumerate(os.listdir(tmpdir)):
+            print(f"Processing frame {i}{f} in {tmpdir}")
+            frame_num = int(f.split(".")[0])
+            frame_in_sec = self.framerate / (rate + 1)  # TODO: improve timestamp calc
+            frame_in_vid = frame_in_sec + (frame_num - 1) * self.framerate
+            ts = frame_in_vid / self.framerate
+            ts = pyass.timedelta(seconds=ts)
+            if not memory:
+                self.frames.append(Frame(os.path.join(tmpdir, f), frame_num, ts))
+            else:
                 self.frames.append(Frame(Image.open(os.path.join(tmpdir, f)), frame_num, ts))
-            self.frames.sort(key=lambda x: x.frame_num)
-            print(f"Total frames: {len(self.frames)}")
+        self.frames.sort(key=lambda x: x.frame_num)
+        print(f"Total frames: {len(self.frames)}")
 
     def _remove_similar_frames(self):
         i = 0
@@ -93,44 +104,70 @@ class VideoProcessor:
 
     def _save_frames(self, path: str):
         os.makedirs(path, exist_ok=True)
-        for i, f in enumerate(self.frames):
-            f.image.save(os.path.join(path, f"{i}.jpg"))
+        for i, fr in enumerate(self.frames):
+            if isinstance(fr.image, str):
+                shutil.copy2(fr.image, path)
+            else:
+                fr.image.save(os.path.join(path, f"{i}.jpg"))
 
-    def ocr_video(self, videopath: str, rate: int = 1):
-        self._get_frames(videopath, rate)
+    def ocr_video(self, videopath: str, rate: int = 1, memory: bool = False):
+        self._get_frames(videopath, rate, memory)
         # self._save_frames("frames")
         self._remove_similar_frames()
         # self._save_frames("frames2")
-        for f in self.frames:
-            f.text = self.reader.readtext(f.image)
+        for fr in self.frames:
+            fr.text = self.reader.readtext(fr.image)
             i = 0
 
-            while i < len(f.text):
-                if f.text[i][2] < 0.7:
-                    del f.text[i]
+            while i < len(fr.text):
+                if fr.text[i][2] < 0.7:
+                    del fr.text[i]
                 else:
                     i += 1
 
-            print(f.text)
+            print(fr.text)
+
+        if isinstance(self.frames[0].image, str):
+            from pymage_size import get_image_size
+
+            img_format = get_image_size(self.frames[0].image)
+            width, height = img_format.get_dimensions()
+            self.size = (width, height)
+        else:
+            width = self.frames[0].image.width
+            height = self.frames[0].image.height
+            self.size = (width, height)
+
+        self.tempdir.cleanup()
 
     def make_ass(self, videopath: str = None, rate: int = 1) -> pyass.Script:
         if videopath is not None:
             self.ocr_video(videopath, rate)
 
         fin_ass = pyass.Script()
-        fin_ass.scriptInfo.append(("PlayResX", str(self.frames[0].image.width)))
-        fin_ass.scriptInfo.append(("PlayResY", str(self.frames[0].image.height)))
-        fin_ass.styles.append(pyass.Style(borderStyle=pyass.BorderStyle.BORDER_STYLE_OPAQUE_BOX))
+
+        width = self.size[0]
+        height = self.size[1]
+
+        fin_ass.scriptInfo.append(("PlayResX", str(width)))
+        fin_ass.scriptInfo.append(("PlayResY", str(height)))
+        fin_ass.styles.append(
+            pyass.Style(borderStyle=pyass.BorderStyle.BORDER_STYLE_OPAQUE_BOX, alignment=pyass.Alignment.TOP_LEFT))
 
         for i, x in enumerate(self.frames):
             for y in x.text:
                 end_frame = self.frames[i + 1] if i + 1 < len(self.frames) else self.frames[i]
-                text = "{\pos(" + str(int(y[0][0][0])) + "," + str(int(y[0][0][0])) + ")} " + y[1]
+                text = "{\pos(" + str(int(y[0][0][0])) + "," + str(int(y[0][0][1])) + ")} " + y[1]
                 fin_ass.events.append(
                     pyass.Event(format=pyass.EventFormat.DIALOGUE, start=self.frames[i].ts, end=end_frame.ts,
                                 text=text))
 
         return fin_ass
+
+    def dump_ass(self, output_path: str, videopath: str = None, rate: int = 1):
+        sub = self.make_ass(videopath, rate)
+        with open(output_path, "w+", encoding="utf_8_sig") as f:
+            pyass.dump(sub, f)
 
 
 if __name__ == "__main__":
@@ -148,6 +185,8 @@ if __name__ == "__main__":
     parser.add_argument("--rate", "-r", type=int, default=1,
                         help="Amount of frames analyzed per second, must be >= video framerate")
     parser.add_argument("--gpu", action="store_true", default=False, help="Use your GPU for OCR")
+    parser.add_argument("--memory", "-m", action="store_true", default=False, help="Load all frames into memory")
+    parser.add_argument("--output", "-o", type=str, help="Set output filepath")
 
     args = parser.parse_args()
 
@@ -156,8 +195,12 @@ if __name__ == "__main__":
         exit(1)
 
     ocrer = VideoProcessor([args.lang.strip()], args.gpu)
-    ocrer.ocr_video(args.videopath.strip(), args.rate)
+    ocrer.ocr_video(args.videopath.strip(), args.rate, args.memory)
     sub = ocrer.make_ass()
-    print(sub)
-    with open("sample.ass", "w+", encoding="utf_8_sig") as f:
+    # print(sub)
+    if args.output is None:
+        outputpath = os.path.join(os.getcwd(), os.path.basename(args.videopath.strip()) + "-ocr.ass")
+    else:
+        outputpath = args.videopath.strip()
+    with open(outputpath, "w+", encoding="utf_8_sig") as f:
         pyass.dump(sub, f)

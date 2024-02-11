@@ -4,3 +4,4 @@ tqdm>=4.66.1
 Pillow>=10.2.0
 easyocr>=1.7.1
 pyass>=0.1.4
+pymage-size>=1.7.1
