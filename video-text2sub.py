@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import shutil
 import subprocess
@@ -10,6 +12,7 @@ import scipy
 import easyocr
 import pyass
 from PIL import Image
+from tqdm import tqdm
 
 
 class Frame:
@@ -80,8 +83,8 @@ class VideoProcessor:
         cmd = shlex.split(cmd)
         subprocess.run(cmd, check=True)
 
-        for i, f in enumerate(os.listdir(tmpdir)):
-            print(f"Processing frame {i}{f} in {tmpdir}")
+        print(f"Processing frames")
+        for i, f in tqdm(enumerate(os.listdir(tmpdir))):
             frame_num = int(f.split(".")[0])
             frame_in_sec = self.framerate / (rate + 1)  # TODO: improve timestamp calc
             frame_in_vid = frame_in_sec + (frame_num - 1) * self.framerate
@@ -101,6 +104,7 @@ class VideoProcessor:
                 del self.frames[i]
             else:
                 i += 1
+        print(f"Frames after removing similar: {len(self.frames)}")
 
     def _save_frames(self, path: str):
         os.makedirs(path, exist_ok=True)
@@ -115,7 +119,8 @@ class VideoProcessor:
         # self._save_frames("frames")
         self._remove_similar_frames()
         # self._save_frames("frames2")
-        for fr in self.frames:
+        print(f"OCRing frames")
+        for fr in tqdm(self.frames):
             fr.text = self.reader.readtext(fr.image)
             i = 0
 
@@ -125,7 +130,7 @@ class VideoProcessor:
                 else:
                     i += 1
 
-            print(fr.text)
+            # print(fr.text)
 
         if isinstance(self.frames[0].image, str):
             from pymage_size import get_image_size
@@ -157,7 +162,7 @@ class VideoProcessor:
         for i, x in enumerate(self.frames):
             for y in x.text:
                 end_frame = self.frames[i + 1] if i + 1 < len(self.frames) else self.frames[i]
-                text = "{\pos(" + str(int(y[0][0][0])) + "," + str(int(y[0][0][1])) + ")} " + y[1]
+                text = "{\pos(" + str(int(y[0][0][0])) + "," + str(int(y[0][0][1])) + ")} " + y[1]  # TODO fix
                 fin_ass.events.append(
                     pyass.Event(format=pyass.EventFormat.DIALOGUE, start=self.frames[i].ts, end=end_frame.ts,
                                 text=text))
