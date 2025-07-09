@@ -17,7 +17,10 @@ from tqdm import tqdm
 
 class Frame:
     def __init__(self, image: Image.Image | str, frame_num: int, ts: pyass.timedelta):
-        self.image = image
+        if isinstance(image, str):
+            self.image = image
+        else:
+            self.image = image.convert('L')
         self.frame_num = frame_num
         self.ts = ts
         self.hash = None
@@ -32,11 +35,11 @@ class Frame:
 
         if isinstance(self.image, str):
             image = Image.open(self.image)
+            image = image.convert('L')
         else:
             image = self.image
 
         img_size = hash_size * highfreq_factor
-        image = image.convert('L')
         image = image.resize((img_size, img_size), Image.Resampling.LANCZOS)
         dct = scipy.fft.dct(scipy.fft.dct(image, axis=0), axis=1)
         dctlowfreq = dct[:hash_size, :hash_size]
@@ -70,7 +73,12 @@ class VideoProcessor:
         cmd = f"ffprobe -v error -select_streams v -of default=noprint_wrappers=1:nokey=1 -show_entries stream=r_frame_rate {videopath}"
         cmd = shlex.split(cmd)
         ret = subprocess.run(cmd, capture_output=True, check=True)
-        self.framerate = float(ret.stdout.decode("utf-8").strip().split("/")[0])
+        fps_str = ret.stdout.decode("utf-8").strip().split("/")
+        if fps_str[1].strip() == "1":
+            self.framerate = float(fps_str[0])
+        else:
+            num, den = map(float, fps_str)
+            self.framerate = num / den
         if int(self.framerate) < rate:
             raise ValueError("Rate higher than video framerate")
         print(self.framerate)
@@ -86,9 +94,7 @@ class VideoProcessor:
         print(f"Processing frames")
         for i, f in tqdm(enumerate(os.listdir(tmpdir))):
             frame_num = int(f.split(".")[0])
-            frame_in_sec = self.framerate / (rate + 1)  # TODO: improve timestamp calc
-            frame_in_vid = frame_in_sec + (frame_num - 1) * self.framerate
-            ts = frame_in_vid / self.framerate
+            ts = (frame_num - 1) / rate
             ts = pyass.timedelta(seconds=ts)
             if not memory:
                 self.frames.append(Frame(os.path.join(tmpdir, f), frame_num, ts))
@@ -162,7 +168,7 @@ class VideoProcessor:
         for i, x in enumerate(self.frames):
             for y in x.text:
                 end_frame = self.frames[i + 1] if i + 1 < len(self.frames) else self.frames[i]
-                text = "{\pos(" + str(int(y[0][0][0])) + "," + str(int(y[0][0][1])) + ")} " + y[1]  # TODO fix
+                text = r"{\pos(" + str(int(y[0][0][0])) + "," + str(int(y[0][0][1])) + ")} " + y[1]
                 fin_ass.events.append(
                     pyass.Event(format=pyass.EventFormat.DIALOGUE, start=self.frames[i].ts, end=end_frame.ts,
                                 text=text))
@@ -187,7 +193,7 @@ if __name__ == "__main__":
     parser.add_argument("videopath", type=str, help="Path to the video you want to OCR")
     parser.add_argument("--lang", "-l", type=str, default="en",
                         help="Select a language supported by EasyOCR you want to OCR")
-    parser.add_argument("--rate", "-r", type=int, default=1,
+    parser.add_argument("--rate", "-r", type=int, default=5,
                         help="Amount of frames analyzed per second, must be >= video framerate")
     parser.add_argument("--gpu", action="store_true", default=False, help="Use your GPU for OCR")
     parser.add_argument("--memory", "-m", action="store_true", default=False, help="Load all frames into memory")
@@ -206,6 +212,6 @@ if __name__ == "__main__":
     if args.output is None:
         outputpath = os.path.join(os.getcwd(), os.path.basename(args.videopath.strip()) + "-ocr.ass")
     else:
-        outputpath = args.videopath.strip()
+        outputpath = args.output.strip()
     with open(outputpath, "w+", encoding="utf_8_sig") as f:
         pyass.dump(sub, f)
