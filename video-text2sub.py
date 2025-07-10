@@ -104,12 +104,11 @@ class VideoProcessor:
         print(f"Total frames: {len(self.frames)}")
 
     def _remove_similar_frames(self):
-        i = 0
-        while i < len(self.frames) - 1:
-            if _are_similar_frame(self.frames[i], self.frames[i + 1]):
-                del self.frames[i]
-            else:
-                i += 1
+        kept = [self.frames[0]]
+        for frame in self.frames[1:]:
+            if not _are_similar_frame(kept[-1], frame):
+                kept.append(frame)
+        self.frames = kept
         print(f"Frames after removing similar: {len(self.frames)}")
 
     def _save_frames(self, path: str):
@@ -193,7 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("videopath", type=str, help="Path to the video you want to OCR")
     parser.add_argument("--lang", "-l", type=str, default="en",
                         help="Select a language supported by EasyOCR you want to OCR")
-    parser.add_argument("--rate", "-r", type=int, default=5,
+    parser.add_argument("--rate", "-r", type=int, default=7,
                         help="Amount of frames analyzed per second, must be >= video framerate")
     parser.add_argument("--gpu", action="store_true", default=False, help="Use your GPU for OCR")
     parser.add_argument("--memory", "-m", action="store_true", default=False, help="Load all frames into memory")
