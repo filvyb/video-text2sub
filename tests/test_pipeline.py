@@ -92,7 +92,7 @@ class TrackingTests(unittest.TestCase):
 
 class ConsensusTests(unittest.TestCase):
     def test_default_recognition_cutoff_is_conservative(self):
-        self.assertEqual(MODULE.PipelineConfig().min_rec_score, 0.6)
+        self.assertEqual(MODULE.PipelineConfig().min_rec_score, 0.7)
 
     def candidate(self, text, score):
         sample = MODULE.CropSample(
@@ -119,6 +119,96 @@ class ConsensusTests(unittest.TestCase):
     def test_normalization_groups_case_and_spacing(self):
         self.assertEqual(MODULE._normalize_text("  Café  TEST "), "café test")
         self.assertEqual(MODULE._edit_similarity("ABC", "abc"), 1.0)
+
+
+class SubtitleRenderingTests(unittest.TestCase):
+    def test_font_size_uses_box_height_and_clamps_extremes(self):
+        config = MODULE.PipelineConfig()
+
+        self.assertEqual(MODULE._ass_font_size((0, 0, 100, 53), config), 64)
+        self.assertEqual(MODULE._ass_font_size((0, 0, 100, 2), config), 8)
+        self.assertEqual(MODULE._ass_font_size((0, 0, 100, 300), config), 240)
+
+    def test_width_fit_uses_spacing_before_horizontal_scaling(self):
+        config = MODULE.PipelineConfig(max_char_spacing_ratio=0.15)
+        with patch.object(MODULE, "_measure_ass_text", return_value=100.0):
+            spacing, horizontal_scale = MODULE._ass_width_fit(
+                "test", (0, 0, 112, 20), 40, config
+            )
+
+        self.assertEqual(spacing, 4.0)
+        self.assertEqual(horizontal_scale, 100)
+
+    def test_width_fit_clamps_spacing_and_uses_bounded_scaling(self):
+        config = MODULE.PipelineConfig(
+            max_char_spacing_ratio=0.1,
+            min_horizontal_scale=75,
+            max_horizontal_scale=150,
+        )
+        with patch.object(MODULE, "_measure_ass_text", return_value=50.0):
+            spacing, horizontal_scale = MODULE._ass_width_fit(
+                "x", (0, 0, 100, 20), 20, config
+            )
+
+        self.assertEqual(spacing, 0.0)
+        self.assertEqual(horizontal_scale, 150)
+
+    def test_ass_event_contains_per_track_font_size(self):
+        stable_hash = np.zeros((8, 8), dtype=bool)
+        track = MODULE.TextTrack.from_observations(
+            1,
+            [observation(0.0, (10, 20, 110, 73), stable_hash)],
+            sample_pool_size=1,
+        )
+        track.end = 1.0
+        processor = MODULE.VideoProcessor()
+        processor.size = (1080, 1920)
+        processor.results = [
+            MODULE.TrackResult(
+                track=track,
+                text="Example",
+                confidence=0.9,
+                agreement=1.0,
+                candidates=[],
+            )
+        ]
+
+        with patch.object(MODULE, "_measure_ass_text", return_value=100.0):
+            event = processor.make_ass().events[0]
+
+        self.assertEqual(
+            event.text,
+            r"{\an7\pos(10,20)\fs64\fsp0\fscx100}Example",
+        )
+
+    def test_width_fit_can_be_disabled(self):
+        stable_hash = np.zeros((8, 8), dtype=bool)
+        track = MODULE.TextTrack.from_observations(
+            1,
+            [observation(0.0, (10, 20, 110, 73), stable_hash)],
+            sample_pool_size=1,
+        )
+        track.end = 1.0
+        processor = MODULE.VideoProcessor(
+            config=MODULE.PipelineConfig(fit_width=False)
+        )
+        processor.size = (1080, 1920)
+        processor.results = [
+            MODULE.TrackResult(
+                track=track,
+                text="Example",
+                confidence=0.9,
+                agreement=1.0,
+                candidates=[],
+            )
+        ]
+
+        with patch.object(
+            MODULE, "_measure_ass_text", side_effect=AssertionError("must not measure")
+        ):
+            event = processor.make_ass().events[0]
+
+        self.assertEqual(event.text, r"{\an7\pos(10,20)\fs64}Example")
 
 
 class PaddleBackendTests(unittest.TestCase):

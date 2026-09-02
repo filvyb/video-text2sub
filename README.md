@@ -13,14 +13,9 @@ consensus over several sharp crops.
 - PaddlePaddle 3.2+ installed for your CPU or CUDA environment when using the
   `paddle_static` engine
 
-Install PaddlePaddle using its platform-specific instructions, then install the
-remaining packages:
-
 ```bash
 python -m pip install -r requirements.txt
 ```
-
-The PP-OCRv6 models are downloaded automatically the first time they are used.
 
 ## Usage
 
@@ -67,9 +62,21 @@ Useful tuning options:
 - `--change-patience`: consecutive changed crops required before a track is split.
 - `--samples-per-track`: sharp crops sent to PP-OCR recognition and consensus.
 - `--min-rec-score`: individual recognition cutoff before consensus. The default is
-  `0.6`; readings below that are commonly noise in background signage, while raising
+  `0.7`; readings below `0.6` are almost always noise in background signage, while raising
   it toward `0.9` favors precision over recall.
 - `--consensus-similarity`: normalized text similarity required to vote together.
+- `--font-size-scale`: ASS font size relative to each track's median detected box
+  height. The default `1.2` is calibrated for Arial/libass rendering.
+- `--min-font-size` and `--max-font-size`: clamp dynamically calculated font sizes;
+  defaults are `8` and `240`.
+- `--font-name`: font family used in the ASS file and for measuring text width.
+- `--no-fit-width`: disable width matching and emit neither character-spacing nor
+  horizontal-scaling overrides. Height-based font sizing remains enabled.
+- `--max-char-spacing-ratio`: limits the positive or negative character spacing used
+  to fit the median detected box width; the default is `0.15` times the font size.
+- `--min-horizontal-scale` and `--max-horizontal-scale`: bound the final horizontal
+  scaling used when safe character spacing cannot fit the box; defaults are `75%`
+  and `150%`.
 - `--enable-mkldnn`: opt into oneDNN/MKLDNN CPU acceleration. It is disabled by
   default for Paddle static inference because some Paddle/PaddleX combinations fail
   while converting model attributes in the oneDNN executor. It is not passed to ONNX

@@ -10,13 +10,14 @@ import sys
 import tempfile
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
 import scipy.fft
 from scipy.optimize import linear_sum_assignment
-from PIL import Image, ImageOps
+from PIL import Image, ImageFont, ImageOps
 
 try:
     from tqdm import tqdm
@@ -45,10 +46,18 @@ class PipelineConfig:
     change_patience: int = 2
     samples_per_track: int = 5
     min_track_frames: int = 2
-    min_rec_score: float = 0.6
+    min_rec_score: float = 0.7
     consensus_similarity: float = 0.72
     rec_upscale: float = 2.0
     rec_batch_size: int = 16
+    font_size_scale: float = 1.2
+    min_font_size: int = 8
+    max_font_size: int = 240
+    font_name: str = "Arial"
+    fit_width: bool = True
+    max_char_spacing_ratio: float = 0.15
+    min_horizontal_scale: int = 75
+    max_horizontal_scale: int = 150
     enable_mkldnn: bool = False
 
 
@@ -229,6 +238,94 @@ def _bbox(polygon: np.ndarray) -> Box:
         float(np.max(polygon[:, 0])),
         float(np.max(polygon[:, 1])),
     )
+
+
+def _ass_font_size(box: Box, config: PipelineConfig) -> int:
+    box_height = max(box[3] - box[1], 1.0)
+    scaled_size = box_height * config.font_size_scale
+    return round(min(max(scaled_size, config.min_font_size), config.max_font_size))
+
+
+@lru_cache(maxsize=16)
+def _resolve_ass_font(font_name: str) -> str | None:
+    for candidate in (font_name, f"{font_name}.ttf"):
+        try:
+            ImageFont.truetype(candidate, 16)
+            return candidate
+        except OSError:
+            pass
+
+    try:
+        matched = subprocess.run(
+            ["fc-match", "-f", "%{file}", font_name],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout.strip()
+        if matched and Path(matched).is_file():
+            ImageFont.truetype(matched, 16)
+            return matched
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    for fallback in ("LiberationSans-Regular.ttf", "DejaVuSans.ttf"):
+        try:
+            ImageFont.truetype(fallback, 16)
+            return fallback
+        except OSError:
+            pass
+    return None
+
+
+@lru_cache(maxsize=512)
+def _ass_font(font_name: str, font_size: int):
+    source = _resolve_ass_font(font_name)
+    if source is not None:
+        return ImageFont.truetype(source, font_size)
+    return ImageFont.load_default(size=font_size)
+
+
+def _measure_ass_text(text: str, font_name: str, font_size: int) -> float:
+    font = _ass_font(font_name, font_size)
+    lines = text.splitlines() or [text]
+    return max(float(font.getlength(line)) for line in lines)
+
+
+def _character_gaps(text: str) -> int:
+    character_count = sum(
+        1
+        for character in text
+        if character not in "\n\r\u200c\u200d"
+        and not unicodedata.combining(character)
+        and unicodedata.category(character) != "Cf"
+    )
+    return max(character_count - 1, 0)
+
+
+def _ass_width_fit(
+    text: str, box: Box, font_size: int, config: PipelineConfig
+) -> tuple[float, int]:
+    target_width = max(box[2] - box[0], 1.0)
+    natural_width = max(_measure_ass_text(text, config.font_name, font_size), 1.0)
+    gaps = _character_gaps(text)
+    spacing = 0.0
+    if gaps:
+        desired_spacing = (target_width - natural_width) / gaps
+        spacing_limit = font_size * config.max_char_spacing_ratio
+        spacing = min(max(desired_spacing, -spacing_limit), spacing_limit)
+
+    spaced_width = max(natural_width + spacing * gaps, 1.0)
+    horizontal_scale = round(100.0 * target_width / spaced_width)
+    horizontal_scale = min(
+        max(horizontal_scale, config.min_horizontal_scale),
+        config.max_horizontal_scale,
+    )
+    return spacing, horizontal_scale
+
+
+def _format_ass_number(value: float) -> str:
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 def _box_iou(left: Box, right: Box) -> float:
@@ -785,14 +882,26 @@ class VideoProcessor:
         script.scriptInfo.append(("PlayResY", str(self.size[1])))
         script.styles.append(
             pyass.Style(
+                fontName=self.config.font_name,
                 borderStyle=pyass.BorderStyle.BORDER_STYLE_OPAQUE_BOX,
                 alignment=pyass.Alignment.TOP_LEFT,
             )
         )
 
         for result in self.results:
-            x1, y1, _, _ = result.track.stable_box()
-            text = rf"{{\an7\pos({round(x1)},{round(y1)})}}" + self._escape_ass(result.text)
+            box = result.track.stable_box()
+            x1, y1, _, _ = box
+            font_size = _ass_font_size(box, self.config)
+            overrides = rf"\an7\pos({round(x1)},{round(y1)})\fs{font_size}"
+            if self.config.fit_width:
+                spacing, horizontal_scale = _ass_width_fit(
+                    result.text, box, font_size, self.config
+                )
+                overrides += (
+                    rf"\fsp{_format_ass_number(spacing)}"
+                    rf"\fscx{horizontal_scale}"
+                )
+            text = rf"{{{overrides}}}" + self._escape_ass(result.text)
             script.events.append(
                 pyass.Event(
                     format=pyass.EventFormat.DIALOGUE,
@@ -857,12 +966,59 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-rec-score",
         type=float,
-        default=0.6,
+        default=0.7,
         help="Discard individual OCR readings below this confidence before consensus",
     )
     parser.add_argument("--consensus-similarity", type=float, default=0.72)
     parser.add_argument("--rec-upscale", type=float, default=2.0)
     parser.add_argument("--rec-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--font-size-scale",
+        type=float,
+        default=1.2,
+        help="ASS font size as a multiple of the stable OCR box height",
+    )
+    parser.add_argument(
+        "--min-font-size",
+        type=int,
+        default=8,
+        help="Minimum per-line ASS font size",
+    )
+    parser.add_argument(
+        "--max-font-size",
+        type=int,
+        default=240,
+        help="Maximum per-line ASS font size",
+    )
+    parser.add_argument(
+        "--font-name",
+        default="Arial",
+        help="ASS font family used for rendering and width measurement",
+    )
+    parser.add_argument(
+        "--no-fit-width",
+        dest="fit_width",
+        action="store_false",
+        help="Disable per-line character spacing and horizontal scaling",
+    )
+    parser.add_argument(
+        "--max-char-spacing-ratio",
+        type=float,
+        default=0.15,
+        help="Maximum absolute character spacing as a fraction of font size",
+    )
+    parser.add_argument(
+        "--min-horizontal-scale",
+        type=int,
+        default=75,
+        help="Minimum ASS horizontal font scale percentage after spacing",
+    )
+    parser.add_argument(
+        "--max-horizontal-scale",
+        type=int,
+        default=150,
+        help="Maximum ASS horizontal font scale percentage after spacing",
+    )
     parser.add_argument(
         "--enable-mkldnn",
         action="store_true",
@@ -876,6 +1032,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.videopath.strip():
         parser.error("video path is required")
+    if args.font_size_scale <= 0:
+        parser.error("--font-size-scale must be greater than zero")
+    if args.min_font_size <= 0:
+        parser.error("--min-font-size must be greater than zero")
+    if args.max_font_size < args.min_font_size:
+        parser.error("--max-font-size must be greater than or equal to --min-font-size")
+    if not args.font_name.strip():
+        parser.error("--font-name cannot be empty")
+    if args.max_char_spacing_ratio < 0:
+        parser.error("--max-char-spacing-ratio cannot be negative")
+    if args.min_horizontal_scale <= 0:
+        parser.error("--min-horizontal-scale must be greater than zero")
+    if args.max_horizontal_scale < args.min_horizontal_scale:
+        parser.error(
+            "--max-horizontal-scale must be greater than or equal to "
+            "--min-horizontal-scale"
+        )
 
     config = PipelineConfig(
         rate=args.rate,
@@ -897,6 +1070,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         consensus_similarity=args.consensus_similarity,
         rec_upscale=args.rec_upscale,
         rec_batch_size=args.rec_batch_size,
+        font_size_scale=args.font_size_scale,
+        min_font_size=args.min_font_size,
+        max_font_size=args.max_font_size,
+        font_name=args.font_name.strip(),
+        fit_width=args.fit_width,
+        max_char_spacing_ratio=args.max_char_spacing_ratio,
+        min_horizontal_scale=args.min_horizontal_scale,
+        max_horizontal_scale=args.max_horizontal_scale,
         enable_mkldnn=args.enable_mkldnn,
     )
     processor = VideoProcessor([args.lang.strip()], args.gpu, config)
