@@ -44,6 +44,7 @@ class PipelineConfig:
     det_thresh: float = 0.3
     det_box_thresh: float = 0.5
     det_unclip_ratio: float = 1.1
+    det_batch_size: int = 4
     track_iou: float = 0.25
     max_gap: int = 2
     crop_padding: float = 0.08
@@ -462,18 +463,38 @@ class PaddleOCRBackend:
             return "onnxruntime"
         return "paddle_static"
 
-    def detect(self, image_input) -> list[tuple[np.ndarray, float]]:
-        results = list(self.detector.predict(image_input, batch_size=1))
-        if not results:
+    def detect_batch(
+        self, image_inputs: Sequence
+    ) -> list[list[tuple[np.ndarray, float]]]:
+        inputs = list(image_inputs)
+        if not inputs:
             return []
-        payload = _result_payload(results[0])
-        polygons = payload.get("dt_polys", [])
-        scores = payload.get("dt_scores", [1.0] * len(polygons))
-        return [
-            (np.asarray(polygon, dtype=np.float32), float(score))
-            for polygon, score in zip(polygons, scores)
-            if len(polygon) >= 4
-        ]
+
+        results = list(
+            self.detector.predict(
+                input=inputs,
+                batch_size=min(max(1, self.config.det_batch_size), len(inputs)),
+            )
+        )
+        if len(results) != len(inputs):
+            raise RuntimeError(
+                f"PaddleOCR returned {len(results)} detection results for "
+                f"{len(inputs)} frames"
+            )
+
+        detections = []
+        for result in results:
+            payload = _result_payload(result)
+            polygons = payload.get("dt_polys", [])
+            scores = payload.get("dt_scores", [1.0] * len(polygons))
+            detections.append(
+                [
+                    (np.asarray(polygon, dtype=np.float32), float(score))
+                    for polygon, score in zip(polygons, scores)
+                    if len(polygon) >= 4
+                ]
+            )
+        return detections
 
     def recognize(self, samples: Sequence[CropSample]) -> list[tuple[str, float]]:
         if not samples:
@@ -867,9 +888,22 @@ class VideoProcessor:
                 frame_interval=1.0 / self.config.rate,
                 duration=self.duration,
             )
-            for frame in tqdm(self.frames, desc="Detecting and tracking text"):
-                detections = backend.detect(frame.paddle_input())
-                tracker.update(self._observations(frame.open(), frame.ts, detections))
+            batch_size = max(1, self.config.det_batch_size)
+            batch_starts = range(0, len(self.frames), batch_size)
+            for start in tqdm(
+                batch_starts,
+                total=math.ceil(len(self.frames) / batch_size),
+                desc="Detecting and tracking text",
+                unit="batch",
+            ):
+                frames = self.frames[start : start + batch_size]
+                batch_detections = backend.detect_batch(
+                    [frame.paddle_input() for frame in frames]
+                )
+                for frame, detections in zip(frames, batch_detections):
+                    tracker.update(
+                        self._observations(frame.open(), frame.ts, detections)
+                    )
             self.tracks = tracker.finish_all()
             self.results = self._recognize_tracks(backend)
         finally:
@@ -1086,6 +1120,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.1,
         help="Text box expansion; lower values produce tighter PP-OCR boxes",
     )
+    parser.add_argument(
+        "--det-batch-size",
+        type=int,
+        default=4,
+        help="Sampled video frames processed per detection batch",
+    )
     parser.add_argument("--track-iou", type=float, default=0.25)
     parser.add_argument("--max-gap", type=int, default=2, help="Missed samples tolerated per track")
     parser.add_argument("--crop-padding", type=float, default=0.08)
@@ -1167,6 +1207,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.videopath.strip():
         parser.error("video path is required")
+    if args.det_batch_size <= 0:
+        parser.error("--det-batch-size must be greater than zero")
+    if args.rec_batch_size <= 0:
+        parser.error("--rec-batch-size must be greater than zero")
     if args.font_size_scale <= 0:
         parser.error("--font-size-scale must be greater than zero")
     if args.min_font_size <= 0:
@@ -1208,6 +1252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         det_thresh=args.det_thresh,
         det_box_thresh=args.det_box_thresh,
         det_unclip_ratio=args.det_unclip_ratio,
+        det_batch_size=args.det_batch_size,
         track_iou=args.track_iou,
         max_gap=args.max_gap,
         crop_padding=args.crop_padding,

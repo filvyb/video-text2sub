@@ -262,6 +262,114 @@ class PaddleBackendTests(unittest.TestCase):
         self.assertTrue(all(call["engine"] == "onnxruntime" for call in calls))
         self.assertTrue(all("enable_mkldnn" not in call for call in calls))
 
+    def test_detection_batches_inputs_and_preserves_result_order(self):
+        predict_calls = []
+
+        class FakeDetection:
+            def __init__(self, **_kwargs):
+                pass
+
+            def predict(self, **kwargs):
+                predict_calls.append(kwargs)
+                for index, _image in enumerate(kwargs["input"]):
+                    yield {
+                        "res": {
+                            "dt_polys": [
+                                np.asarray(
+                                    [
+                                        [index, 0],
+                                        [index + 10, 0],
+                                        [index + 10, 5],
+                                        [index, 5],
+                                    ]
+                                )
+                            ],
+                            "dt_scores": [0.8 + index / 10],
+                        }
+                    }
+
+        class FakeRecognition:
+            def __init__(self, **_kwargs):
+                pass
+
+        fake_paddleocr = types.ModuleType("paddleocr")
+        fake_paddleocr.TextDetection = FakeDetection
+        fake_paddleocr.TextRecognition = FakeRecognition
+        config = MODULE.PipelineConfig(engine="paddle_static", det_batch_size=4)
+        with patch.dict(sys.modules, {"paddleocr": fake_paddleocr}):
+            backend = MODULE.PaddleOCRBackend(config, "cpu")
+
+        detections = backend.detect_batch(
+            [np.zeros((10, 20, 3), dtype=np.uint8) for _ in range(3)]
+        )
+
+        self.assertEqual(len(predict_calls), 1)
+        self.assertEqual(len(predict_calls[0]["input"]), 3)
+        self.assertEqual(predict_calls[0]["batch_size"], 3)
+        self.assertEqual([batch[0][1] for batch in detections], [0.8, 0.9, 1.0])
+        self.assertEqual([batch[0][0][0, 0] for batch in detections], [0, 1, 2])
+
+    def test_detection_rejects_missing_batch_results(self):
+        class FakeDetection:
+            def __init__(self, **_kwargs):
+                pass
+
+            def predict(self, **_kwargs):
+                return [{"res": {"dt_polys": [], "dt_scores": []}}]
+
+        class FakeRecognition:
+            def __init__(self, **_kwargs):
+                pass
+
+        fake_paddleocr = types.ModuleType("paddleocr")
+        fake_paddleocr.TextDetection = FakeDetection
+        fake_paddleocr.TextRecognition = FakeRecognition
+        with patch.dict(sys.modules, {"paddleocr": fake_paddleocr}):
+            backend = MODULE.PaddleOCRBackend(
+                MODULE.PipelineConfig(engine="paddle_static"), "cpu"
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "1 detection results for 2 frames"):
+            backend.detect_batch(["first.png", "second.png"])
+
+
+class VideoProcessorBatchingTests(unittest.TestCase):
+    def test_video_frames_are_detected_in_order_in_bounded_batches(self):
+        detection_batches = []
+
+        class FakeBackend:
+            def detect_batch(self, image_inputs):
+                detection_batches.append(list(image_inputs))
+                return [[] for _image_input in image_inputs]
+
+            def recognize(self, _samples):
+                return []
+
+        config = MODULE.PipelineConfig(rate=2, det_batch_size=3)
+        processor = MODULE.VideoProcessor(config=config)
+
+        def get_frames(_videopath, rate, _memory):
+            processor.duration = 3.5
+            processor.frames = [
+                MODULE.Frame(
+                    image=Image.new("RGB", (20, 10), (frame_num, 0, 0)),
+                    frame_num=frame_num,
+                    ts=frame_num / rate,
+                )
+                for frame_num in range(7)
+            ]
+
+        with patch.object(processor, "_get_frames", side_effect=get_frames), patch.object(
+            MODULE, "PaddleOCRBackend", return_value=FakeBackend()
+        ):
+            processor.ocr_video("input.mp4", memory=True)
+
+        self.assertEqual([len(batch) for batch in detection_batches], [3, 3, 1])
+        self.assertEqual(
+            [int(image[0, 0, 2]) for batch in detection_batches for image in batch],
+            list(range(7)),
+        )
+
 
 class DeepLTranslationTests(unittest.TestCase):
     @staticmethod

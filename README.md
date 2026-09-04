@@ -29,6 +29,16 @@ Use a PaddlePaddle GPU build with:
 python video-text2sub.py input.mp4 --gpu
 ```
 
+Detection runs on batches of four sampled video frames by default, while recognition
+runs on batches of 16 text crops. Increase either batch size to improve GPU throughput
+when memory allows:
+
+```bash
+python video-text2sub.py input.mp4 --gpu \
+  --det-batch-size 8 \
+  --rec-batch-size 32
+```
+
 The defaults deliberately use a relatively tight PP-OCR detector expansion:
 
 ```bash
@@ -77,6 +87,10 @@ python video-text2sub.py input.mp4 --translate-to DE --keep-original
 Useful tuning options:
 
 - `--det-unclip-ratio`: lower for tighter boxes; try `1.0` to `1.3`.
+- `--det-batch-size`: sampled frames submitted together for text detection; defaults
+  to `4`. Higher values can improve GPU utilization but use more VRAM.
+- `--rec-batch-size`: detected text crops submitted together for recognition;
+  defaults to `16`.
 - `--engine`: `auto`, `paddle_static`, or `onnxruntime`. Benchmark both engines on
   the target machine; performance varies by CPU, GPU, and runtime build.
 - `--translate-to`: opt into DeepL translation with a target language code such as
