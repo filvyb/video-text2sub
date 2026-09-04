@@ -262,6 +262,44 @@ class PaddleBackendTests(unittest.TestCase):
         self.assertTrue(all(call["engine"] == "onnxruntime" for call in calls))
         self.assertTrue(all("enable_mkldnn" not in call for call in calls))
 
+    def test_batch_size_defaults_follow_device(self):
+        class FakeModel:
+            def __init__(self, **_kwargs):
+                pass
+
+        fake_paddleocr = types.ModuleType("paddleocr")
+        fake_paddleocr.TextDetection = FakeModel
+        fake_paddleocr.TextRecognition = FakeModel
+        with patch.dict(sys.modules, {"paddleocr": fake_paddleocr}):
+            cpu_backend = MODULE.PaddleOCRBackend(
+                MODULE.PipelineConfig(engine="paddle_static"), "cpu"
+            )
+            gpu_backend = MODULE.PaddleOCRBackend(
+                MODULE.PipelineConfig(engine="paddle_static"), "gpu"
+            )
+
+        self.assertEqual(cpu_backend.det_batch_size, 1)
+        self.assertEqual(cpu_backend.rec_batch_size, 1)
+        self.assertEqual(gpu_backend.det_batch_size, 4)
+        self.assertEqual(gpu_backend.rec_batch_size, 16)
+
+    def test_explicit_batch_sizes_override_device_defaults(self):
+        class FakeModel:
+            def __init__(self, **_kwargs):
+                pass
+
+        fake_paddleocr = types.ModuleType("paddleocr")
+        fake_paddleocr.TextDetection = FakeModel
+        fake_paddleocr.TextRecognition = FakeModel
+        config = MODULE.PipelineConfig(
+            engine="paddle_static", det_batch_size=3, rec_batch_size=7
+        )
+        with patch.dict(sys.modules, {"paddleocr": fake_paddleocr}):
+            backend = MODULE.PaddleOCRBackend(config, "cpu")
+
+        self.assertEqual(backend.det_batch_size, 3)
+        self.assertEqual(backend.rec_batch_size, 7)
+
     def test_detection_batches_inputs_and_preserves_result_order(self):
         predict_calls = []
 
@@ -338,6 +376,8 @@ class VideoProcessorBatchingTests(unittest.TestCase):
         detection_batches = []
 
         class FakeBackend:
+            det_batch_size = 3
+
             def detect_batch(self, image_inputs):
                 detection_batches.append(list(image_inputs))
                 return [[] for _image_input in image_inputs]

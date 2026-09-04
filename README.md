@@ -28,6 +28,17 @@ Add `--gpu` to use a compatible GPU runtime:
 uv run python video-text2sub.py input.mp4 --gpu
 ```
 
+CPU inference defaults to batch size 1 for both detection and recognition, based on
+benchmarking the ONNX Runtime engine. GPU inference defaults to 4 frames per detection
+batch and 16 crops per recognition batch. Override either value when tuning for a
+different machine:
+
+```bash
+uv run python video-text2sub.py input.mp4 --gpu \
+  --det-batch-size 8 \
+  --rec-batch-size 32
+```
+
 `--engine auto` prefers ONNX Runtime on CPU and otherwise uses Paddle static
 inference. To install and select ONNX Runtime explicitly:
 
@@ -52,7 +63,8 @@ explicitly or `--keep-original` to include the OCR text above its translation.
 
 ## Common options
 
-- `--det-batch-size`, `--rec-batch-size`: increase throughput at the cost of memory.
+- `--det-batch-size`, `--rec-batch-size`: override the device-specific defaults;
+  larger GPU batches can improve throughput at the cost of VRAM.
 - `--det-unclip-ratio`: lower for tighter detection boxes (`1.0`–`1.3` is typical).
 - `--track-iou`, `--max-gap`: tune how detections are joined across frames.
 - `--samples-per-track`, `--min-rec-score`: tune recognition sampling and confidence.

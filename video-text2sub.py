@@ -44,7 +44,7 @@ class PipelineConfig:
     det_thresh: float = 0.3
     det_box_thresh: float = 0.5
     det_unclip_ratio: float = 1.1
-    det_batch_size: int = 4
+    det_batch_size: int | None = None
     track_iou: float = 0.25
     max_gap: int = 2
     crop_padding: float = 0.08
@@ -55,7 +55,7 @@ class PipelineConfig:
     min_rec_score: float = 0.7
     consensus_similarity: float = 0.72
     rec_upscale: float = 2.0
-    rec_batch_size: int = 16
+    rec_batch_size: int | None = None
     font_size_scale: float = 1.2
     min_font_size: int = 8
     max_font_size: int = 240
@@ -433,6 +433,12 @@ class PaddleOCRBackend:
 
         self.config = config
         self.engine = self._resolve_engine(config.engine, device)
+        self.det_batch_size = self._resolve_batch_size(
+            config.det_batch_size, device, gpu_default=4
+        )
+        self.rec_batch_size = self._resolve_batch_size(
+            config.rec_batch_size, device, gpu_default=16
+        )
         common_options = {
             "device": device,
             "engine": self.engine,
@@ -453,7 +459,11 @@ class PaddleOCRBackend:
             model_name=config.rec_model,
             **common_options,
         )
-        print(f"OCR engine: {self.engine}; detector: {config.det_model}; recognizer: {config.rec_model}")
+        print(
+            f"OCR engine: {self.engine}; detector: {config.det_model} "
+            f"(batch {self.det_batch_size}); recognizer: {config.rec_model} "
+            f"(batch {self.rec_batch_size})"
+        )
 
     @staticmethod
     def _resolve_engine(requested: str, device: str) -> str:
@@ -462,6 +472,17 @@ class PaddleOCRBackend:
         if device == "cpu" and importlib.util.find_spec("onnxruntime") is not None:
             return "onnxruntime"
         return "paddle_static"
+
+    @staticmethod
+    def _resolve_batch_size(
+        requested: int | None, device: str, gpu_default: int
+    ) -> int:
+        batch_size = gpu_default if requested is None and device == "gpu" else requested
+        if batch_size is None:
+            batch_size = 1
+        if batch_size <= 0:
+            raise ValueError("OCR batch sizes must be greater than zero")
+        return batch_size
 
     def detect_batch(
         self, image_inputs: Sequence
@@ -473,7 +494,7 @@ class PaddleOCRBackend:
         results = list(
             self.detector.predict(
                 input=inputs,
-                batch_size=min(max(1, self.config.det_batch_size), len(inputs)),
+                batch_size=min(self.det_batch_size, len(inputs)),
             )
         )
         if len(results) != len(inputs):
@@ -500,7 +521,7 @@ class PaddleOCRBackend:
         if not samples:
             return []
         recognized = []
-        batch_size = max(1, self.config.rec_batch_size)
+        batch_size = self.rec_batch_size
         for start in range(0, len(samples), batch_size):
             inputs = []
             for sample in samples[start : start + batch_size]:
@@ -888,7 +909,7 @@ class VideoProcessor:
                 frame_interval=1.0 / self.config.rate,
                 duration=self.duration,
             )
-            batch_size = max(1, self.config.det_batch_size)
+            batch_size = backend.det_batch_size
             batch_starts = range(0, len(self.frames), batch_size)
             for start in tqdm(
                 batch_starts,
@@ -1123,8 +1144,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--det-batch-size",
         type=int,
-        default=4,
-        help="Sampled video frames processed per detection batch",
+        help="Sampled frames per detection batch (default: CPU 1, GPU 4)",
     )
     parser.add_argument("--track-iou", type=float, default=0.25)
     parser.add_argument("--max-gap", type=int, default=2, help="Missed samples tolerated per track")
@@ -1146,7 +1166,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--consensus-similarity", type=float, default=0.72)
     parser.add_argument("--rec-upscale", type=float, default=2.0)
-    parser.add_argument("--rec-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--rec-batch-size",
+        type=int,
+        help="Text crops per recognition batch (default: CPU 1, GPU 16)",
+    )
     parser.add_argument(
         "--font-size-scale",
         type=float,
@@ -1207,9 +1231,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.videopath.strip():
         parser.error("video path is required")
-    if args.det_batch_size <= 0:
+    if args.det_batch_size is not None and args.det_batch_size <= 0:
         parser.error("--det-batch-size must be greater than zero")
-    if args.rec_batch_size <= 0:
+    if args.rec_batch_size is not None and args.rec_batch_size <= 0:
         parser.error("--rec-batch-size must be greater than zero")
     if args.font_size_scale <= 0:
         parser.error("--font-size-scale must be greater than zero")
