@@ -50,11 +50,39 @@ For ONNX GPU inference, install `onnxruntime-gpu` instead of `onnxruntime`, then
 `--engine onnxruntime --gpu`. Only one of those ONNX Runtime packages should be
 installed in an environment.
 
+### Optional DeepL translation
+
+Put your DeepL API key in the `DEEPL_AUTH_KEY` environment variable and select a
+target language:
+
+```bash
+export DEEPL_AUTH_KEY="your-api-key"
+python video-text2sub.py input.mp4 --translate-to DE
+```
+
+The integration calls the DeepL HTTP API directly using the project's `requests`
+dependency, and selects the Free or Pro endpoint from the API key. DeepL detects each
+source language automatically. To set it explicitly, add (for example)
+`--translate-from EN`. Translation replaces the recognized text in the ASS output
+while retaining each track's timing and screen position. Identical recognized strings
+are sent only once and reused across tracks.
+
+To keep the untranslated OCR text as the first line and place its translation below
+it, use:
+
+```bash
+python video-text2sub.py input.mp4 --translate-to DE --keep-original
+```
+
 Useful tuning options:
 
 - `--det-unclip-ratio`: lower for tighter boxes; try `1.0` to `1.3`.
 - `--engine`: `auto`, `paddle_static`, or `onnxruntime`. Benchmark both engines on
   the target machine; performance varies by CPU, GPU, and runtime build.
+- `--translate-to`: opt into DeepL translation with a target language code such as
+  `DE`, `FR`, or `EN-US`; requires `DEEPL_AUTH_KEY`.
+- `--translate-from`: set the DeepL source language instead of auto-detecting it.
+- `--keep-original`: retain the untranslated OCR text above the DeepL translation.
 - `--track-iou`: lower if a noisy detector keeps breaking one text line into tracks.
 - `--max-gap`: number of missed sampled frames tolerated before ending a track.
 - `--crop-change-distance`: pHash distance from `0` to `64` used to notice text

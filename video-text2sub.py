@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
+import requests
 import scipy.fft
 from scipy.optimize import linear_sum_assignment
 from PIL import Image, ImageFont, ImageOps
@@ -27,6 +28,10 @@ except ImportError:
 
 
 Box = tuple[float, float, float, float]
+DEEPL_BATCH_SIZE = 50
+DEEPL_API_URL = "https://api.deepl.com/v2/translate"
+DEEPL_API_FREE_URL = "https://api-free.deepl.com/v2/translate"
+DEEPL_REQUEST_TIMEOUT = 60
 
 
 @dataclass
@@ -403,6 +408,16 @@ def _result_payload(result) -> Mapping:
     if isinstance(payload.get("res"), Mapping):
         payload = payload["res"]
     return payload
+
+
+def _deepl_auth_key() -> str:
+    auth_key = os.environ.get("DEEPL_AUTH_KEY", "").strip()
+    if not auth_key:
+        raise RuntimeError(
+            "DEEPL_AUTH_KEY is not set; export your DeepL API key before "
+            "using --translate-to"
+        )
+    return auth_key
 
 
 class PaddleOCRBackend:
@@ -862,6 +877,111 @@ class VideoProcessor:
                 self.tempdir.cleanup()
                 self.tempdir = None
 
+    def translate_with_deepl(
+        self,
+        target_lang: str,
+        source_lang: str | None = None,
+        keep_original: bool = False,
+    ) -> int:
+        """Translate recognized text in place, returning the number of tracks changed."""
+        target_lang = target_lang.strip()
+        source_lang = source_lang.strip() if source_lang is not None else None
+        if not target_lang:
+            raise ValueError("DeepL target language cannot be empty")
+        if source_lang == "":
+            source_lang = None
+
+        unique_texts = list(
+            dict.fromkeys(result.text for result in self.results if result.text)
+        )
+        if not unique_texts:
+            return 0
+
+        auth_key = _deepl_auth_key()
+        api_url = DEEPL_API_FREE_URL if auth_key.endswith(":fx") else DEEPL_API_URL
+        headers = {
+            "Authorization": f"DeepL-Auth-Key {auth_key}",
+            "User-Agent": "video-text2sub",
+        }
+        translations: dict[str, str] = {}
+        for start in range(0, len(unique_texts), DEEPL_BATCH_SIZE):
+            batch = unique_texts[start : start + DEEPL_BATCH_SIZE]
+            request_body = {
+                "text": batch,
+                "target_lang": target_lang,
+                "preserve_formatting": True,
+            }
+            if source_lang is not None:
+                request_body["source_lang"] = source_lang
+
+            try:
+                response = requests.post(
+                    api_url,
+                    headers=headers,
+                    json=request_body,
+                    timeout=DEEPL_REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as error:
+                raise RuntimeError(f"DeepL request failed: {error}") from error
+
+            try:
+                response_body = response.json()
+            except requests.exceptions.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"DeepL returned an invalid response (HTTP {response.status_code})"
+                ) from error
+            if not response.ok:
+                message = (
+                    response_body.get("message")
+                    if isinstance(response_body, Mapping)
+                    else None
+                )
+                detail = message or response.reason or "unknown error"
+                raise RuntimeError(
+                    f"DeepL request failed (HTTP {response.status_code}): {detail}"
+                )
+
+            response_translations = (
+                response_body.get("translations")
+                if isinstance(response_body, Mapping)
+                else None
+            )
+            if not isinstance(response_translations, list) or len(
+                response_translations
+            ) != len(batch):
+                count = (
+                    len(response_translations)
+                    if isinstance(response_translations, list)
+                    else 0
+                )
+                raise RuntimeError(
+                    f"DeepL returned {count} translations for {len(batch)} texts"
+                )
+            for original, translated in zip(batch, response_translations):
+                translated_text = (
+                    translated.get("text")
+                    if isinstance(translated, Mapping)
+                    else None
+                )
+                if not isinstance(translated_text, str):
+                    raise RuntimeError(
+                        "DeepL returned an unsupported translation result"
+                    )
+                translations[original] = translated_text
+
+        translated_tracks = 0
+        for result in self.results:
+            if result.text in translations:
+                original_text = result.text
+                translated_text = translations[original_text]
+                result.text = (
+                    f"{original_text}\n{translated_text}"
+                    if keep_original
+                    else translated_text
+                )
+                translated_tracks += 1
+        return translated_tracks
+
     @staticmethod
     def _escape_ass(text: str) -> str:
         return text.replace("{", r"\{").replace("}", r"\}").replace("\n", r"\N")
@@ -933,6 +1053,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu", action="store_true", help="Run PaddleOCR on the GPU")
     parser.add_argument("--memory", "-m", action="store_true", help="Load sampled frames into RAM")
     parser.add_argument("--output", "-o", help="Output ASS path")
+    parser.add_argument(
+        "--translate-to",
+        metavar="LANG",
+        help="Translate recognized text with DeepL (for example: DE or EN-US)",
+    )
+    parser.add_argument(
+        "--translate-from",
+        metavar="LANG",
+        help="DeepL source language; omit to use automatic detection",
+    )
+    parser.add_argument(
+        "--keep-original",
+        action="store_true",
+        help="Keep the OCR text above its DeepL translation",
+    )
 
     parser.add_argument("--det-model", default="PP-OCRv6_medium_det")
     parser.add_argument("--rec-model", default="PP-OCRv6_medium_rec")
@@ -1049,6 +1184,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--max-horizontal-scale must be greater than or equal to "
             "--min-horizontal-scale"
         )
+    if args.translate_to is not None and not args.translate_to.strip():
+        parser.error("--translate-to cannot be empty")
+    if args.translate_from is not None and not args.translate_from.strip():
+        parser.error("--translate-from cannot be empty")
+    if args.translate_from is not None and args.translate_to is None:
+        parser.error("--translate-from requires --translate-to")
+    if args.keep_original and args.translate_to is None:
+        parser.error("--keep-original requires --translate-to")
+    if args.translate_to is not None:
+        # Fail before potentially lengthy OCR when optional translation is not set up.
+        try:
+            _deepl_auth_key()
+        except RuntimeError as error:
+            parser.error(str(error))
 
     config = PipelineConfig(
         rate=args.rate,
@@ -1082,6 +1231,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     processor = VideoProcessor([args.lang.strip()], args.gpu, config)
     processor.ocr_video(args.videopath.strip(), memory=args.memory)
+    if args.translate_to is not None:
+        translated_tracks = processor.translate_with_deepl(
+            args.translate_to,
+            args.translate_from,
+            keep_original=args.keep_original,
+        )
+        print(f"Translated {translated_tracks} text tracks with DeepL")
     output_path = args.output or os.path.join(
         os.getcwd(), os.path.basename(args.videopath.strip()) + "-ocr.ass"
     )

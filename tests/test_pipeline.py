@@ -262,5 +262,157 @@ class PaddleBackendTests(unittest.TestCase):
         self.assertTrue(all(call["engine"] == "onnxruntime" for call in calls))
         self.assertTrue(all("enable_mkldnn" not in call for call in calls))
 
+
+class DeepLTranslationTests(unittest.TestCase):
+    @staticmethod
+    def result(text):
+        stable_hash = np.zeros((8, 8), dtype=bool)
+        track = MODULE.TextTrack.from_observations(
+            1,
+            [observation(0.0, (10, 20, 110, 40), stable_hash)],
+            sample_pool_size=1,
+        )
+        track.end = 1.0
+        return MODULE.TrackResult(
+            track=track,
+            text=text,
+            confidence=0.9,
+            agreement=1.0,
+            candidates=[],
+        )
+
+    def test_translation_deduplicates_text_and_preserves_result_order(self):
+        calls = []
+
+        class Response:
+            ok = True
+            status_code = 200
+            reason = "OK"
+
+            def __init__(self, texts):
+                self.texts = texts
+
+            def json(self):
+                return {
+                    "translations": [
+                        {"text": f"translated:{text}"} for text in self.texts
+                    ]
+                }
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            return Response(kwargs["json"]["text"])
+
+        processor = MODULE.VideoProcessor()
+        processor.results = [
+            self.result("Hello"),
+            self.result("World"),
+            self.result("Hello"),
+        ]
+
+        with patch.object(MODULE.requests, "post", side_effect=post), patch.dict(
+            MODULE.os.environ, {"DEEPL_AUTH_KEY": "test-key"}
+        ):
+            translated = processor.translate_with_deepl("DE", "EN")
+
+        self.assertEqual(translated, 3)
+        self.assertEqual(calls[0][0], MODULE.DEEPL_API_URL)
+        self.assertEqual(
+            calls[0][1]["headers"]["Authorization"],
+            "DeepL-Auth-Key test-key",
+        )
+        self.assertEqual(
+            calls[0][1]["json"],
+            {
+                "text": ["Hello", "World"],
+                "target_lang": "DE",
+                "preserve_formatting": True,
+                "source_lang": "EN",
+            },
+        )
+        self.assertEqual(calls[0][1]["timeout"], MODULE.DEEPL_REQUEST_TIMEOUT)
+        self.assertEqual(
+            [result.text for result in processor.results],
+            ["translated:Hello", "translated:World", "translated:Hello"],
+        )
+
+    def test_free_key_uses_free_endpoint_and_auto_detects_source(self):
+        calls = []
+
+        class Response:
+            ok = True
+            status_code = 200
+            reason = "OK"
+
+            def json(self):
+                return {"translations": [{"text": "Bonjour"}]}
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            return Response()
+
+        processor = MODULE.VideoProcessor()
+        processor.results = [self.result("Hello")]
+
+        with patch.object(MODULE.requests, "post", side_effect=post), patch.dict(
+            MODULE.os.environ, {"DEEPL_AUTH_KEY": "test-key:fx"}
+        ):
+            processor.translate_with_deepl("FR")
+
+        self.assertEqual(calls[0][0], MODULE.DEEPL_API_FREE_URL)
+        self.assertNotIn("source_lang", calls[0][1]["json"])
+        self.assertEqual(processor.results[0].text, "Bonjour")
+
+    def test_keep_original_places_translation_on_second_line(self):
+        class Response:
+            ok = True
+            status_code = 200
+            reason = "OK"
+
+            def json(self):
+                return {"translations": [{"text": "Bonjour"}]}
+
+        processor = MODULE.VideoProcessor()
+        processor.results = [self.result("Hello")]
+
+        with patch.object(MODULE.requests, "post", return_value=Response()), patch.dict(
+            MODULE.os.environ, {"DEEPL_AUTH_KEY": "test-key"}
+        ):
+            processor.translate_with_deepl("FR", keep_original=True)
+
+        self.assertEqual(processor.results[0].text, "Hello\nBonjour")
+        self.assertEqual(
+            MODULE.VideoProcessor._escape_ass(processor.results[0].text),
+            r"Hello\NBonjour",
+        )
+
+    def test_translation_requires_environment_api_key(self):
+        processor = MODULE.VideoProcessor()
+        processor.results = [self.result("Hello")]
+
+        with patch.dict(MODULE.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "DEEPL_AUTH_KEY"):
+                processor.translate_with_deepl("DE")
+
+    def test_api_error_does_not_replace_recognized_text(self):
+        class Response:
+            ok = False
+            status_code = 456
+            reason = "Quota Exceeded"
+
+            def json(self):
+                return {"message": "Quota exceeded"}
+
+        processor = MODULE.VideoProcessor()
+        processor.results = [self.result("Hello")]
+
+        with patch.object(MODULE.requests, "post", return_value=Response()), patch.dict(
+            MODULE.os.environ, {"DEEPL_AUTH_KEY": "test-key"}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 456.*Quota exceeded"):
+                processor.translate_with_deepl("DE")
+
+        self.assertEqual(processor.results[0].text, "Hello")
+
 if __name__ == "__main__":
     unittest.main()
