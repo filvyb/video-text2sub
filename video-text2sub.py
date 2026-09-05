@@ -62,7 +62,7 @@ class PipelineConfig:
     font_name: str = "Arial"
     fit_width: bool = True
     max_char_spacing_ratio: float = 0.15
-    min_horizontal_scale: int = 75
+    min_horizontal_scale: int = 100
     max_horizontal_scale: int = 150
     enable_mkldnn: bool = False
 
@@ -319,7 +319,7 @@ def _ass_width_fit(
     if gaps:
         desired_spacing = (target_width - natural_width) / gaps
         spacing_limit = font_size * config.max_char_spacing_ratio
-        spacing = min(max(desired_spacing, -spacing_limit), spacing_limit)
+        spacing = min(max(desired_spacing, 0.0), spacing_limit)
 
     spaced_width = max(natural_width + spacing * gaps, 1.0)
     horizontal_scale = round(100.0 * target_width / spaced_width)
@@ -1069,14 +1069,22 @@ class VideoProcessor:
             font_size = _ass_font_size(box, self.config)
             overrides = rf"\an7\pos({round(x1)},{round(y1)})\fs{font_size}"
             if self.config.fit_width:
-                spacing, horizontal_scale = _ass_width_fit(
-                    result.text, box, font_size, self.config
-                )
-                overrides += (
-                    rf"\fsp{_format_ass_number(spacing)}"
-                    rf"\fscx{horizontal_scale}"
-                )
-            text = rf"{{{overrides}}}" + self._escape_ass(result.text)
+                rendered_lines = []
+                for index, line in enumerate(result.text.split("\n")):
+                    spacing, horizontal_scale = _ass_width_fit(
+                        line, box, font_size, self.config
+                    )
+                    line_overrides = overrides if index == 0 else ""
+                    line_overrides += (
+                        rf"\fsp{_format_ass_number(spacing)}"
+                        rf"\fscx{horizontal_scale}"
+                    )
+                    rendered_lines.append(
+                        rf"{{{line_overrides}}}" + self._escape_ass(line)
+                    )
+                text = r"\N".join(rendered_lines)
+            else:
+                text = rf"{{{overrides}}}" + self._escape_ass(result.text)
             script.events.append(
                 pyass.Event(
                     format=pyass.EventFormat.DIALOGUE,
@@ -1204,13 +1212,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-char-spacing-ratio",
         type=float,
         default=0.15,
-        help="Maximum absolute character spacing as a fraction of font size",
+        help="Maximum added character spacing as a fraction of font size (never negative)",
     )
     parser.add_argument(
         "--min-horizontal-scale",
         type=int,
-        default=75,
-        help="Minimum ASS horizontal font scale percentage after spacing",
+        default=100,
+        help="Minimum ASS horizontal font scale percentage (default: 100; lower allows squeezing)",
     )
     parser.add_argument(
         "--max-horizontal-scale",

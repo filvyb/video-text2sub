@@ -153,6 +153,64 @@ class SubtitleRenderingTests(unittest.TestCase):
         self.assertEqual(spacing, 0.0)
         self.assertEqual(horizontal_scale, 150)
 
+    def test_long_text_keeps_natural_spacing_and_character_width(self):
+        config = MODULE.PipelineConfig()
+        for text in ("iiiiiiiiiiii", "A much longer translated subtitle"):
+            with self.subTest(text=text):
+                spacing, horizontal_scale = MODULE._ass_width_fit(
+                    text, (0, 0, 20, 40), 40, config
+                )
+                self.assertEqual(spacing, 0.0)
+                self.assertEqual(horizontal_scale, 100)
+
+    def test_explicit_compression_does_not_add_negative_spacing(self):
+        config = MODULE.PipelineConfig(min_horizontal_scale=90)
+        with patch.object(MODULE, "_measure_ass_text", return_value=200.0):
+            spacing, horizontal_scale = MODULE._ass_width_fit(
+                "Longer translation", (0, 0, 100, 40), 40, config
+            )
+
+        self.assertEqual(spacing, 0.0)
+        self.assertEqual(horizontal_scale, 90)
+
+    def test_cli_defaults_preserve_natural_character_width(self):
+        args = MODULE._build_parser().parse_args(["input.mp4"])
+        self.assertEqual(args.min_horizontal_scale, 100)
+        self.assertEqual(
+            args.min_horizontal_scale, MODULE.PipelineConfig().min_horizontal_scale
+        )
+
+    def test_original_and_translation_are_fitted_independently(self):
+        track = MODULE.TextTrack.from_observations(
+            1,
+            [observation(0.0, (10, 20, 110, 73), np.zeros((8, 8), dtype=bool))],
+            sample_pool_size=1,
+        )
+        track.end = 1.0
+        processor = MODULE.VideoProcessor()
+        processor.size = (1080, 1920)
+        processor.results = [
+            MODULE.TrackResult(
+                track=track,
+                text="Short\nA much longer translation",
+                confidence=0.9,
+                agreement=1.0,
+                candidates=[],
+            )
+        ]
+
+        def measure(text, _font_name, _font_size):
+            return {"Short": 80.0, "A much longer translation": 300.0}[text]
+
+        with patch.object(MODULE, "_measure_ass_text", side_effect=measure):
+            event = processor.make_ass().events[0]
+
+        self.assertEqual(
+            event.text,
+            r"{\an7\pos(10,20)\fs64\fsp5\fscx100}Short"
+            r"\N{\fsp0\fscx100}A much longer translation",
+        )
+
     def test_ass_event_contains_per_track_font_size(self):
         stable_hash = np.zeros((8, 8), dtype=bool)
         track = MODULE.TextTrack.from_observations(
